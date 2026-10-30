@@ -11,6 +11,10 @@ pub type OpenAsyncFn = Box<dyn FnMut(&str, u64)>;
 
 pub type DownloadFn = Box<dyn FnMut(&str, &[u8])>;
 
+/// Plans how content fills a scanned presentation template for the AI PPT Maker. The desktop
+/// default scans and calls the engine off the UI thread; hosts and tests can supply their own.
+pub type AiPlanFn = dyn Fn(String, std::sync::Arc<deckcraft_model::Presentation>) -> Result<deckcraft_engine::ai::TemplatePlan, String> + Send + Sync;
+
 /// A file the host finished reading for the request `id` from [`SlideApp::begin_external_file`].
 #[derive(Clone, Debug)]
 pub struct InboxFile {
@@ -47,6 +51,9 @@ pub struct Services {
     pub open_async: Option<OpenAsyncFn>,
     /// Hand bytes to the user as a named file (browser download).
     pub download: Option<DownloadFn>,
+    /// Plans the AI PPT Maker's template fill; the desktop default scans and calls the engine on
+    /// a worker thread.
+    pub plan_template: Option<std::sync::Arc<AiPlanFn>>,
     pub inbox: Option<Inbox>,
     /// Image on the system clipboard (PNG bytes), when the host can read one.
     pub clipboard_image: Option<Box<dyn FnMut() -> Option<Vec<u8>>>>,

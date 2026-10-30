@@ -46,6 +46,7 @@ impl SlideApp {
             squiggles: Default::default(),
             dialog: None,
             thesaurus_query: String::new(),
+            ai: Default::default(),
             show: None,
             anim_preview: None,
             reuse_target: None,
@@ -219,6 +220,9 @@ impl SlideApp {
             // Inbox results are host file bytes and do not need fonts or a painted frame. A
             // window that starts hidden must still apply a file picked before its first UI pass.
             self.drain_inbox();
+            // Applying a plan changes the active document, so it also waits for any admitted
+            // synthetic batch to finish, like opening and inbox results above.
+            self.poll_ai_plan(ctx);
         }
         self.drain_screenshots();
         // `raw_input_hook` ran before this logic pass. This is normally a no-op now that

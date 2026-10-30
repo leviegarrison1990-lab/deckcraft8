@@ -10,7 +10,7 @@ use crate::ribbon::{cref_param, paint_anim_tile};
 use crate::theme::{self, Tokens};
 use crate::{SlideApp, widgets};
 
-mod ai;
+pub(crate) mod ai;
 mod animation;
 mod background;
 mod comments;

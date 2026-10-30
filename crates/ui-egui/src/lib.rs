@@ -71,7 +71,7 @@ pub use panels::notes;
 pub use panels::selpane;
 pub use panels::thumbs;
 pub use ribbon::qat;
-pub use services::{DownloadFn, Inbox, InboxEvent, InboxFile, OpenAsyncFn, PickFn, ReadFn, Services, WriteFn};
+pub use services::{AiPlanFn, DownloadFn, Inbox, InboxEvent, InboxFile, OpenAsyncFn, PickFn, ReadFn, Services, WriteFn};
 use state::{FilePlace, FilePurpose, ImeDescriptorKey, ImeDestination, ImeTerminalStamp};
 pub use state::{RECENT_MAX, UiState, ViewMode, ZOOM_RANGE};
 
@@ -224,6 +224,8 @@ pub struct SlideApp {
     pub dialog: Option<dialogs::Dialog>,
     /// The word looked up in the Thesaurus pane.
     pub thesaurus_query: String,
+    /// The AI PPT Maker pane's outline and in-flight planning job.
+    pub(crate) ai: panels::ai::State,
     pub show: Option<show::Show>,
     /// Current slide's animations playing on the editor canvas (not the full-screen show).
     anim_preview: Option<AnimPreview>,

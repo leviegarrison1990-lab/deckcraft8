@@ -366,12 +366,15 @@ Detail in [localization-parity.md](localization-parity.md).
 
 - **No Designer, Copilot, Speaker Coach, live subtitles or Translate.** All are Microsoft cloud
   services; an offline rule-based Designer is in the catalogue (P2). Local models (speech-to-text
-  for subtitles, translation) need an owner decision on licensed models. 20–40 h.
+  for subtitles, translation) need an owner decision on licensed models. A first AI PPT Maker
+  flow fills the open deck's cards from an outline through NVIDIA NIM with a user-supplied key,
+  but there is no offline model, picture suggestion or design gallery. 20–40 h.
 
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-31 | trivial | AI PPT Maker fills the open deck's cards from an outline via NVIDIA NIM; Designer, Copilot, Speaker Coach, live subtitles and Translate remain open |
 | 2026-10-25 | trivial | New entries: copying text and cell ranges (no media, no table), a control-server timing test that may fail under load; Proofing notes that automatic lists follow Replace text as you type and that Backspace puts the typed lead back |
 | 2026-10-24 | trivial | AutoFormat starts bulleted and numbered lists as you type (`* `, `-- `, `> `, `1. `, `a) ` and the rest), with an AutoCorrect option to turn it off |
 | 2026-10-22 | minor | Animation Pane ▸ Play From starts the preview at the selected effect; gap 10 keeps the effect gallery (7–13 h) |
