@@ -9,12 +9,20 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use deckcraft_model::resolve::{self, Ctx};
 use deckcraft_model::{Presentation, Shape, ShapeId, Slide};
 use serde::{Deserialize, Serialize};
 
 use super::scan;
 use crate::cmd::edit::{cleanup_deleted, remove_shapes};
 use crate::{EngineError, Result};
+
+const CONNECTOR_TOUCH_TOLERANCE: f64 = 5.0;
+const CONNECTOR_MAX_AREA_FRAC: f64 = 0.02;
+
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ApplyPlan {
@@ -27,6 +35,8 @@ pub struct ApplySlide {
     pub keep_slot_ids: Vec<String>,
     #[serde(default)]
     pub realign: RealignMode,
+    #[serde(default = "default_true")]
+    pub prune_orphan_connectors: bool,
 }
 
 #[derive(Debug, Default, Deserialize, PartialEq, Eq, Clone, Copy)]
@@ -66,6 +76,7 @@ struct StagedSlide {
 
 pub fn apply_plan(doc: &mut Presentation, plan: &ApplyPlan) -> Result<ApplyResult> {
     let slide_w = doc.slide_size.width;
+    let slide_h = doc.slide_size.height;
 
     // Stage: validate the whole plan before mutating anything, so a bad plan doesn't
     // leave a partial delete on the undo stack.
@@ -94,6 +105,11 @@ pub fn apply_plan(doc: &mut Presentation, plan: &ApplyPlan) -> Result<ApplyResul
                 for id in &slot.children {
                     delete_ids.push(ShapeId(*id));
                 }
+            }
+        }
+        if s.prune_orphan_connectors {
+            for id in connector_prune_targets(doc, s.index, &scan, &keep, slide_w, slide_h) {
+                delete_ids.push(ShapeId(id));
             }
         }
         staged.push(StagedSlide { index: s.index, realign: s.realign, delete_ids, kept, rows: scan.rows });
@@ -176,6 +192,44 @@ fn shape_ids(shapes: &[Shape]) -> HashSet<ShapeId> {
         out.insert(s.id);
     });
     out
+}
+
+/// Decorations that bridged at least two cards before the delete but bridge fewer than
+/// two kept cards. A decoration that only ever touched one card is not a connector and
+/// is left alone, so ordinary design elements are not collateral damage.
+fn connector_prune_targets(
+    doc: &Presentation,
+    slide_index: usize,
+    scan: &scan::SlideScan,
+    kept: &HashSet<&str>,
+    slide_w: f64,
+    slide_h: f64,
+) -> Vec<u32> {
+    let slide_area = slide_w * slide_h;
+    let Some(slide) = doc.slides.get(slide_index) else { return Vec::new() };
+    let Some(ctx) = Ctx::for_slide(doc, slide) else { return Vec::new() };
+    let all_cards: Vec<[f64; 4]> = scan.candidate_slots.iter().map(|s| s.bbox).collect();
+    let kept_cards: Vec<[f64; 4]> = scan.candidate_slots.iter().filter(|s| kept.contains(s.id.as_str())).map(|s| s.bbox).collect();
+    let mut out = Vec::new();
+    for &dec_id in &scan.decorations {
+        let Some(sh) = slide.shape(ShapeId(dec_id)) else { continue };
+        let x = resolve::xfrm(&ctx, sh);
+        let dec_box = [x.x, x.y, x.w, x.h];
+        if (x.w * x.h).abs() > slide_area * CONNECTOR_MAX_AREA_FRAC {
+            continue;
+        }
+        if all_cards.iter().filter(|c| intersects(dec_box, **c, CONNECTOR_TOUCH_TOLERANCE)).count() < 2 {
+            continue;
+        }
+        if kept_cards.iter().filter(|c| intersects(dec_box, **c, CONNECTOR_TOUCH_TOLERANCE)).count() < 2 {
+            out.push(dec_id);
+        }
+    }
+    out
+}
+
+fn intersects(a: [f64; 4], b: [f64; 4], tolerance: f64) -> bool {
+    a[0] - tolerance < b[0] + b[2] && a[0] + a[2] + tolerance > b[0] && a[1] - tolerance < b[1] + b[3] && a[1] + a[3] + tolerance > b[1]
 }
 
 fn bad(msg: String) -> EngineError {
@@ -266,6 +320,18 @@ mod tests {
         doc
     }
 
+    fn two_cards_with(extra: Vec<Shape>) -> Presentation {
+        let mut doc = deck(1440.0, 810.0);
+        let mut shapes = vec![card(10, 50.0, 100.0, 300.0, 220.0), card(20, 380.0, 100.0, 300.0, 220.0)];
+        shapes.extend(extra);
+        add_slide(&mut doc, shapes);
+        doc
+    }
+
+    fn arrow(id: u32, x: f64, y: f64, w: f64, h: f64) -> Shape {
+        group(id, x, y, w, h, vec![solid(id + 1, 0.0, 0.0, w, h)])
+    }
+
     fn two_slides() -> Presentation {
         let mut doc = deck(1440.0, 810.0);
         for s in 0..2u32 {
@@ -280,7 +346,14 @@ mod tests {
     }
 
     fn plan(keep: &[&str], realign: RealignMode) -> ApplyPlan {
-        ApplyPlan { slides: vec![ApplySlide { index: 0, keep_slot_ids: keep.iter().map(|s| (*s).to_string()).collect(), realign }] }
+        ApplyPlan {
+            slides: vec![ApplySlide {
+                index: 0,
+                keep_slot_ids: keep.iter().map(|s| (*s).to_string()).collect(),
+                realign,
+                prune_orphan_connectors: true,
+            }],
+        }
     }
 
     fn plan_json(keep: &[&str], realign: Option<&str>) -> serde_json::Value {
@@ -405,6 +478,77 @@ mod tests {
     }
 
     #[test]
+    fn connector_between_two_kept_is_preserved() {
+        let mut doc = two_cards_with(vec![arrow(30, 345.0, 150.0, 40.0, 20.0)]);
+        let res = apply_plan(&mut doc, &plan(&["s0-c0", "s0-c1"], RealignMode::None)).unwrap();
+        assert_eq!(res.slides[0].deleted, 0);
+        assert!(doc.slides[0].shape(ShapeId(30)).is_some());
+        assert!(doc.slides[0].shape(ShapeId(31)).is_some());
+    }
+
+    #[test]
+    fn connector_with_one_dropped_is_removed() {
+        let mut doc = two_cards_with(vec![arrow(30, 345.0, 150.0, 40.0, 20.0)]);
+        let res = apply_plan(&mut doc, &plan(&["s0-c0"], RealignMode::None)).unwrap();
+        assert_eq!(res.slides[0].deleted, 3, "dropped card 20, arrow group 30, arrow child 31");
+        assert!(doc.slides[0].shape(ShapeId(20)).is_none());
+        assert!(doc.slides[0].shape(ShapeId(30)).is_none());
+        assert!(doc.slides[0].shape(ShapeId(31)).is_none());
+    }
+
+    #[test]
+    fn connector_between_two_dropped_is_removed() {
+        let doc = two_cards_with(vec![arrow(30, 345.0, 150.0, 40.0, 20.0)]);
+        let scan = scan::scan_slide(&doc, 0).unwrap();
+        let targets = connector_prune_targets(&doc, 0, &scan, &std::collections::HashSet::new(), 1440.0, 810.0);
+        assert_eq!(targets, [30]);
+    }
+
+    #[test]
+    fn decoration_touching_one_card_untouched() {
+        let mut doc = two_cards_with(vec![arrow(40, 354.0, 150.0, 20.0, 20.0)]);
+        let res = apply_plan(&mut doc, &plan(&["s0-c0", "s0-c1"], RealignMode::None)).unwrap();
+        assert_eq!(res.slides[0].deleted, 0);
+        assert!(doc.slides[0].shape(ShapeId(40)).is_some());
+    }
+
+    #[test]
+    fn decoration_touching_nothing_untouched() {
+        let mut doc = two_cards_with(vec![arrow(40, 1000.0, 600.0, 20.0, 20.0)]);
+        let res = apply_plan(&mut doc, &plan(&["s0-c0", "s0-c1"], RealignMode::None)).unwrap();
+        assert_eq!(res.slides[0].deleted, 0);
+        assert!(doc.slides[0].shape(ShapeId(40)).is_some());
+    }
+
+    #[test]
+    fn prune_disabled_keeps_all_connectors() {
+        let mut doc = two_cards_with(vec![arrow(30, 345.0, 150.0, 40.0, 20.0)]);
+        let mut p = plan(&["s0-c0"], RealignMode::None);
+        p.slides[0].prune_orphan_connectors = false;
+        let res = apply_plan(&mut doc, &p).unwrap();
+        assert_eq!(res.slides[0].deleted, 1);
+        assert!(doc.slides[0].shape(ShapeId(30)).is_some());
+    }
+
+    #[test]
+    fn prune_does_not_touch_non_connector_decorations() {
+        let mut doc = two_cards_with(vec![arrow(30, 345.0, 150.0, 40.0, 20.0), arrow(40, 1000.0, 600.0, 20.0, 20.0)]);
+        let res = apply_plan(&mut doc, &plan(&["s0-c0"], RealignMode::None)).unwrap();
+        assert_eq!(res.slides[0].deleted, 3);
+        assert!(doc.slides[0].shape(ShapeId(30)).is_none());
+        assert!(doc.slides[0].shape(ShapeId(40)).is_some());
+    }
+
+    #[test]
+    fn prune_is_idempotent() {
+        let mut doc = two_cards_with(vec![arrow(30, 345.0, 150.0, 40.0, 20.0)]);
+        let first = apply_plan(&mut doc, &plan(&["s0-c0"], RealignMode::Auto)).unwrap();
+        assert_eq!(first.slides[0].deleted, 3);
+        let second = apply_plan(&mut doc, &plan(&["s0-c0"], RealignMode::Auto)).unwrap();
+        assert_eq!((second.slides[0].deleted, second.slides[0].moved), (0, 0));
+    }
+
+    #[test]
     #[ignore = "needs DECKCRAFT_TEST_PPTX"]
     fn apply_mud_slide6() {
         let Some(path) = std::env::var_os("DECKCRAFT_TEST_PPTX") else { return };
@@ -413,10 +557,15 @@ mod tests {
         let scan = scan::scan_slide(&doc, 6).unwrap();
         let keep: Vec<String> = scan.candidate_slots.iter().take(5).map(|s| s.id.clone()).collect();
         let dropped: usize = scan.candidate_slots.iter().skip(5).map(|s| s.children.len()).sum();
-        let plan = ApplyPlan { slides: vec![ApplySlide { index: 6, keep_slot_ids: keep, realign: RealignMode::Auto }] };
+        let plan =
+            ApplyPlan { slides: vec![ApplySlide { index: 6, keep_slot_ids: keep, realign: RealignMode::Auto, prune_orphan_connectors: true }] };
         let res = apply_plan(&mut doc, &plan).unwrap();
-        assert_eq!(res.slides[0].deleted, dropped);
+        assert_eq!(res.slides[0].deleted, dropped + 4, "two connector groups and their children");
         assert_eq!((res.slides[0].moved, res.slides[0].rows_realigned), (4, 1));
+        for id in [85, 87] {
+            assert!(doc.slides[6].shape(ShapeId(id)).is_none(), "orphan arrow {id} survived");
+        }
+        assert!(doc.slides[6].shape(ShapeId(83)).is_some(), "arrow 83 still bridges cards 37 and 47");
         println!("mud slide 6: {:?}", res.slides[0]);
     }
 

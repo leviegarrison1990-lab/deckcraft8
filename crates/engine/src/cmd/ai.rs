@@ -29,7 +29,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Apply Template Plan",
             [],
             None,
-            "{plan: {slides: [{index, keep_slot_ids: [string], realign?: auto|none}]}} -> {slides: [{index, deleted, moved, rows_realigned}]}",
+            "{plan: {slides: [{index, keep_slot_ids: [string], realign?: auto|none, prune_orphan_connectors?: bool = true}]}} -> {slides: [{index, deleted, moved, rows_realigned}]}",
             has_doc,
             apply_cmd
         ),
