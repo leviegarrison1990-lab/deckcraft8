@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 
 use super::{CommandSpec, always, bad, cmd, has_doc, opt_usize_param, str_param};
-use crate::ai::{PlanRequest, plan as plan_with_ai};
+use crate::ai::{PlanRequest, TemplatePlanRequest, plan as plan_with_ai, plan_template as plan_template_with_ai};
 use crate::{EngineError, Result, Session};
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -25,6 +25,15 @@ pub fn specs() -> Vec<CommandSpec> {
             template_scan
         ),
         cmd!(
+            query "ai.planTemplate",
+            "Plan Template",
+            [],
+            None,
+            "{content, slidesFromScan: [SlideScan], model?} -> {slides: [{index, keep_slot_ids: [string], fills?: [{slot_id, heading?, body?}]}]}",
+            always,
+            plan_template_cmd
+        ),
+        cmd!(
             "ai.applyTemplatePlan",
             "Apply Template Plan",
             [],
@@ -43,6 +52,18 @@ fn plan_cmd(_s: &mut Session, p: &Value) -> Result<Value> {
     let model = str_param(p, "model");
     let result = plan_with_ai(PlanRequest { prompt, slides, theme, model })?;
     serde_json::to_value(result).map_err(|e| EngineError::Other(format!("could not encode the plan: {e}")))
+}
+
+fn plan_template_cmd(_s: &mut Session, p: &Value) -> Result<Value> {
+    let content = str_param(p, "content").ok_or_else(|| bad("ai.planTemplate", "missing `content`"))?;
+    let scans_val =
+        p.get("slidesFromScan").or_else(|| p.get("slides_from_scan")).ok_or_else(|| bad("ai.planTemplate", "missing `slidesFromScan`"))?;
+    let scans_val = scans_val.get("slides").unwrap_or(scans_val);
+    let scans: Vec<crate::ai::SlideScan> =
+        serde_json::from_value(scans_val.clone()).map_err(|e| bad("ai.planTemplate", format!("bad `slidesFromScan`: {e}")))?;
+    let model = str_param(p, "model");
+    let result = plan_template_with_ai(TemplatePlanRequest { content, slides_from_scan: &scans, model })?;
+    serde_json::to_value(result).map_err(|e| EngineError::Other(format!("could not encode the template plan: {e}")))
 }
 
 fn template_scan(_s: &mut Session, p: &Value) -> Result<Value> {
@@ -93,6 +114,28 @@ mod tests {
     fn a_negative_slide_count_is_rejected() {
         let mut session = Session::with_new();
         let err = plan_cmd(&mut session, &json!({"prompt": "deck", "slides": -1})).unwrap_err();
+        assert!(matches!(err, EngineError::BadParams { .. }));
+    }
+
+    #[test]
+    fn ai_plan_template_is_a_query_and_needs_input() {
+        let spec = specs().into_iter().find(|s| s.id == "ai.planTemplate").unwrap();
+        assert!(!spec.journal);
+        assert!(!spec.undoable);
+        let mut session = Session::with_new();
+        assert!((spec.enabled)(&session).is_ok());
+        for params in [json!({}), json!({"content": "# Slide 1: A"}), json!({"slidesFromScan": []})] {
+            let err = (spec.run)(&mut session, &params).unwrap_err();
+            assert!(matches!(err, EngineError::BadParams { .. }));
+        }
+    }
+
+    #[test]
+    fn plan_template_rejects_bad_scan_input_before_network() {
+        let mut session = Session::with_new();
+        let err = plan_template_cmd(&mut session, &json!({"content": "# Slide 1: A", "slidesFromScan": [{}]})).unwrap_err();
+        assert!(matches!(err, EngineError::BadParams { .. }));
+        let err = plan_template_cmd(&mut session, &json!({"content": "# Slide 1: A", "slidesFromScan": []})).unwrap_err();
         assert!(matches!(err, EngineError::BadParams { .. }));
     }
 

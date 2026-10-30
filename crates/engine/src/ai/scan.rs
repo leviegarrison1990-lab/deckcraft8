@@ -6,7 +6,7 @@ use std::collections::HashSet;
 
 use deckcraft_model::resolve::{self, Ctx};
 use deckcraft_model::{Fill, Presentation, Shape, ShapeKind};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const CARD_MIN_AREA_FRAC: f64 = 0.05;
 const TITLE_BAND_FRAC: f64 = 0.15;
@@ -14,7 +14,7 @@ const PAGE_NUM_AREA_FRAC: f64 = 0.005;
 const PAGE_NUM_CORNER_FRAC: f64 = 0.15;
 const ALPHA_EPS: f64 = 0.001;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandidateSlot {
     pub id: String,
     pub bbox: [f64; 4],
@@ -31,7 +31,7 @@ pub struct CandidateSlot {
     pub flags: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlideScan {
     pub index: usize,
     pub layout: String,
