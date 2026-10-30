@@ -1,5 +1,6 @@
 //! The command registry. Ids follow PowerPoint's ribbon and menu structure.
 
+pub mod ai;
 pub mod animation;
 pub mod arrange;
 pub mod artistic;
@@ -162,6 +163,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
     static SPECS: std::sync::OnceLock<Vec<CommandSpec>> = std::sync::OnceLock::new();
     SPECS.get_or_init(|| {
         let mut v = Vec::new();
+        v.extend(ai::specs());
         v.extend(file::specs());
         v.extend(edit::specs());
         v.extend(slide::specs());

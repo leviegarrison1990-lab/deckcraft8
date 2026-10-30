@@ -67,6 +67,7 @@ craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "92d392cff13
 i_overlay = "9"
 quick-xml = "0.41"
 zip = { version = "3", default-features = false, features = ["deflate"] }
+ureq = { version = "3.5.0", default-features = false, features = ["rustls-no-provider", "_ring", "gzip", "platform-verifier"] }
 
 # ui
 egui = { version = "0.37", default-features = false }
