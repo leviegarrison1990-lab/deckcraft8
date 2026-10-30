@@ -1,4 +1,5 @@
-//! Apply a template plan: delete dropped slots, then realign the survivors within their rows.
+//! Apply a template plan: delete dropped slots, fill the survivors, then realign them within
+//! their rows.
 //!
 //! DeckCraft has `edit.delete`, `shape.setBounds`, `arrange.align` and `arrange.distribute`,
 //! but none compose here: `setBounds` applies one box to every target, `align`/`distribute`
@@ -10,9 +11,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use deckcraft_model::resolve::{self, Ctx};
+use deckcraft_model::text::{ParaProps, RunProps, TextBody};
 use deckcraft_model::{Presentation, Shape, ShapeId, Slide};
 use serde::{Deserialize, Serialize};
 
+use super::plan::SlotFill;
 use super::scan;
 use crate::cmd::edit::{cleanup_deleted, remove_shapes};
 use crate::{EngineError, Result};
@@ -33,6 +36,8 @@ pub struct ApplyPlan {
 pub struct ApplySlide {
     pub index: usize,
     pub keep_slot_ids: Vec<String>,
+    #[serde(default)]
+    pub fills: Vec<SlotFill>,
     #[serde(default)]
     pub realign: RealignMode,
     #[serde(default = "default_true")]
@@ -58,6 +63,7 @@ pub struct SlideResult {
     pub deleted: usize,
     pub moved: usize,
     pub rows_realigned: usize,
+    pub filled: usize,
 }
 
 struct SlotInfo {
@@ -66,12 +72,26 @@ struct SlotInfo {
     top_level: Vec<u32>,
 }
 
+struct StagedFill {
+    heading: Option<(u32, String)>,
+    body: Option<(u32, String)>,
+}
+
+struct ParaStyle {
+    level: u8,
+    props: ParaProps,
+    def_props: RunProps,
+    end_props: RunProps,
+    run: Option<RunProps>,
+}
+
 struct StagedSlide {
     index: usize,
     realign: RealignMode,
     delete_ids: Vec<ShapeId>,
     kept: Vec<SlotInfo>,
     rows: Vec<Vec<u32>>,
+    fills: Vec<StagedFill>,
 }
 
 pub fn apply_plan(doc: &mut Presentation, plan: &ApplyPlan) -> Result<ApplyResult> {
@@ -112,7 +132,8 @@ pub fn apply_plan(doc: &mut Presentation, plan: &ApplyPlan) -> Result<ApplyResul
                 delete_ids.push(ShapeId(id));
             }
         }
-        staged.push(StagedSlide { index: s.index, realign: s.realign, delete_ids, kept, rows: scan.rows });
+        let fills = stage_fills(s.index, &scan, &keep, &delete_ids, &s.fills)?;
+        staged.push(StagedSlide { index: s.index, realign: s.realign, delete_ids, kept, rows: scan.rows, fills });
     }
 
     // Apply: mutate each slide once, so the whole plan is one undo entry per Session::edit.
@@ -149,9 +170,106 @@ pub fn apply_plan(doc: &mut Presentation, plan: &ApplyPlan) -> Result<ApplyResul
             }
         }
 
-        result.slides.push(SlideResult { index: st.index, deleted, moved, rows_realigned });
+        let filled = st.fills.len();
+        for fill in &st.fills {
+            if let Some((id, text)) = &fill.heading {
+                fill_text_shape(slide, ShapeId(*id), text)?;
+            }
+            if let Some((id, text)) = &fill.body {
+                fill_text_shape(slide, ShapeId(*id), text)?;
+            }
+        }
+
+        result.slides.push(SlideResult { index: st.index, deleted, moved, rows_realigned, filled });
     }
     Ok(result)
+}
+
+fn stage_fills(
+    slide_index: usize,
+    scan: &scan::SlideScan,
+    keep: &HashSet<&str>,
+    delete_ids: &[ShapeId],
+    fills: &[SlotFill],
+) -> Result<Vec<StagedFill>> {
+    let deleting: HashSet<ShapeId> = delete_ids.iter().copied().collect();
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(fills.len());
+    for fill in fills {
+        if !seen.insert(fill.slot_id.as_str()) {
+            return Err(bad(format!("slide {slide_index} fills slot `{}` more than once", fill.slot_id)));
+        }
+        if !keep.contains(fill.slot_id.as_str()) {
+            return Err(bad(format!("slide {slide_index} fills slot `{}` but does not keep it", fill.slot_id)));
+        }
+        let slot = scan
+            .candidate_slots
+            .iter()
+            .find(|slot| slot.id == fill.slot_id)
+            .ok_or_else(|| bad(format!("slide {slide_index} has no slot `{}`", fill.slot_id)))?;
+        if fill.heading.is_none() && fill.body.is_none() {
+            return Err(bad(format!("slide {slide_index} fill for `{}` needs a heading or body", fill.slot_id)));
+        }
+        let heading = match (&fill.heading, slot.heading) {
+            (Some(text), Some(id)) => Some((id, text.clone())),
+            (Some(_), None) => return Err(bad(format!("slide {slide_index} slot `{}` has no heading", fill.slot_id))),
+            (None, _) => None,
+        };
+        let body = match (&fill.body, slot.body) {
+            (Some(text), Some(id)) => Some((id, text.clone())),
+            (Some(_), None) => return Err(bad(format!("slide {slide_index} slot `{}` has no body", fill.slot_id))),
+            (None, _) => None,
+        };
+        for (id, _) in heading.iter().chain(body.iter()) {
+            if deleting.contains(&ShapeId(*id)) {
+                return Err(bad(format!("slide {slide_index} fill for `{}` targets a dropped shape", fill.slot_id)));
+            }
+        }
+        out.push(StagedFill { heading, body });
+    }
+    Ok(out)
+}
+
+fn fill_text_shape(slide: &mut Slide, id: ShapeId, text: &str) -> Result<()> {
+    let Some(shape) = deckcraft_model::find_shape_mut(&mut slide.shapes, id) else {
+        return Err(EngineError::Other(format!("ai.applyTemplatePlan: fill target {id} disappeared mid-apply")));
+    };
+    let Some(body) = shape.text.as_mut() else {
+        return Err(EngineError::Other(format!("ai.applyTemplatePlan: fill target {id} lost its text body")));
+    };
+    fill_text_body(body, text);
+    Ok(())
+}
+
+fn fill_text_body(target: &mut TextBody, text: &str) {
+    let styles: Vec<ParaStyle> = target
+        .paragraphs
+        .iter()
+        .map(|p| ParaStyle {
+            level: p.level,
+            props: p.props.clone(),
+            def_props: p.def_props.clone(),
+            end_props: p.end_props.clone(),
+            run: p.runs.first().map(|r| r.props.clone()),
+        })
+        .collect();
+    let fallback_run = styles.iter().find_map(|style| style.run.clone()).unwrap_or_default();
+    let mut next = TextBody::from_text(text);
+    if !styles.is_empty() {
+        let last = styles.len() - 1;
+        for (i, paragraph) in next.paragraphs.iter_mut().enumerate() {
+            let style = &styles[i.min(last)];
+            paragraph.level = style.level;
+            paragraph.props = style.props.clone();
+            paragraph.def_props = style.def_props.clone();
+            paragraph.end_props = style.end_props.clone();
+            let run = style.run.as_ref().unwrap_or(&fallback_run);
+            for r in &mut paragraph.runs {
+                r.props = run.clone();
+            }
+        }
+    }
+    target.paragraphs = next.paragraphs;
 }
 
 fn realign_row(slide: &mut Slide, slide_w: f64, row_slots: &mut Vec<&SlotInfo>) -> usize {
@@ -243,7 +361,8 @@ mod tests {
     use std::sync::Arc;
 
     use deckcraft_model::style::PictureFill;
-    use deckcraft_model::{ColorRef, Fill, LayoutId, Rgba, Shape, ShapeId, ShapeKind, Slide, SlideId, TextBody, Xfrm};
+    use deckcraft_model::text::Bullet;
+    use deckcraft_model::{ColorRef, Fill, LayoutId, Paragraph, Rgba, Shape, ShapeId, ShapeKind, Slide, SlideId, TextBody, Xfrm};
     use serde_json::json;
 
     use super::*;
@@ -350,6 +469,7 @@ mod tests {
             slides: vec![ApplySlide {
                 index: 0,
                 keep_slot_ids: keep.iter().map(|s| (*s).to_string()).collect(),
+                fills: Vec::new(),
                 realign,
                 prune_orphan_connectors: true,
             }],
@@ -478,6 +598,122 @@ mod tests {
     }
 
     #[test]
+    fn apply_fills_heading_and_body() {
+        let mut doc = three_slots();
+        let mut p = plan(&["s0-c0"], RealignMode::None);
+        p.slides[0].fills.push(SlotFill {
+            slot_id: "s0-c0".into(),
+            heading: Some("Why now".into()),
+            body: Some("Market shift\nCustomer pain".into()),
+        });
+        let res = apply_plan(&mut doc, &p).unwrap();
+        assert_eq!(res.slides[0].filled, 1);
+        assert_eq!(shape(&doc, 13).text.as_ref().unwrap().text(), "Why now");
+        assert_eq!(shape(&doc, 14).text.as_ref().unwrap().text(), "Market shift\nCustomer pain");
+    }
+
+    #[test]
+    fn apply_fill_keeps_template_paragraph_formatting_for_extra_lines() {
+        let mut doc = three_slots();
+        {
+            let slide = Arc::make_mut(&mut doc.slides[0]);
+            let body = slide.shape_mut(ShapeId(14)).unwrap().text.as_mut().unwrap();
+            body.paragraphs = vec![Paragraph::new("First"), Paragraph::new("Second")];
+            body.paragraphs[0].level = 0;
+            body.paragraphs[0].props.bullet = Some(Bullet::Char { char: "•".into() });
+            body.paragraphs[0].props.margin_left = Some(18.0);
+            body.paragraphs[0].runs[0].props.size = Some(18.0);
+            body.paragraphs[0].runs[0].props.bold = Some(true);
+            body.paragraphs[1].level = 1;
+            body.paragraphs[1].props.bullet = Some(Bullet::Char { char: "–".into() });
+            body.paragraphs[1].props.margin_left = Some(36.0);
+            body.paragraphs[1].runs[0].props.size = Some(14.0);
+            body.paragraphs[1].runs[0].props.bold = None;
+        }
+        let mut p = plan(&["s0-c0"], RealignMode::None);
+        p.slides[0].fills.push(SlotFill { slot_id: "s0-c0".into(), heading: None, body: Some("A\nB\nC\nD".into()) });
+        apply_plan(&mut doc, &p).unwrap();
+        let body = shape(&doc, 14).text.as_ref().unwrap();
+        assert_eq!(body.paragraphs.len(), 4);
+        assert_eq!(body.paragraphs.iter().map(|p| p.level).collect::<Vec<_>>(), [0, 1, 1, 1]);
+        assert_eq!(body.paragraphs[0].props.margin_left, Some(18.0));
+        assert_eq!(body.paragraphs[0].props.bullet, Some(Bullet::Char { char: "•".into() }));
+        assert_eq!(body.paragraphs[0].runs[0].props.size, Some(18.0));
+        assert_eq!(body.paragraphs[0].runs[0].props.bold, Some(true));
+        assert_eq!(body.paragraphs[2].props.margin_left, Some(36.0));
+        assert_eq!(body.paragraphs[3].props.bullet, Some(Bullet::Char { char: "–".into() }));
+        assert_eq!(body.paragraphs[2].runs[0].props.size, Some(14.0));
+        assert_eq!(body.paragraphs[2].runs[0].props.bold, None);
+        assert_eq!(body.paragraphs[2].text(), "C");
+    }
+
+    #[test]
+    fn fill_rejects_a_slot_that_is_not_kept() {
+        let mut s = session(three_slots());
+        let before = serde_json::to_vec(&*s.doc().unwrap().doc).unwrap();
+        let before_undo = undo_len(&s);
+        let err = s
+            .execute(
+                "ai.applyTemplatePlan",
+                &json!({"plan": {"slides": [{"index": 0, "keep_slot_ids": ["s0-c0"], "fills": [{"slot_id": "s0-c1", "heading": "Two"}]}]}}),
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::BadParams { msg, .. } if msg.contains("does not keep")));
+        assert_eq!(serde_json::to_vec(&*s.doc().unwrap().doc).unwrap(), before);
+        assert_eq!(undo_len(&s), before_undo);
+    }
+
+    #[test]
+    fn fill_rejects_an_empty_fill() {
+        let mut s = session(three_slots());
+        let err = s
+            .execute(
+                "ai.applyTemplatePlan",
+                &json!({"plan": {"slides": [{"index": 0, "keep_slot_ids": ["s0-c0"], "fills": [{"slot_id": "s0-c0"}]}]}}),
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::BadParams { msg, .. } if msg.contains("needs a heading or body")));
+    }
+
+    #[test]
+    fn fill_rejects_a_missing_target_field() {
+        let mut doc = deck(1440.0, 810.0);
+        add_slide(&mut doc, vec![card(10, 50.0, 100.0, 300.0, 220.0)]);
+        let mut p = plan(&["s0-c0"], RealignMode::None);
+        p.slides[0].fills.push(SlotFill { slot_id: "s0-c0".into(), heading: Some("Title".into()), body: None });
+        let err = apply_plan(&mut doc, &p).unwrap_err();
+        assert!(matches!(err, EngineError::BadParams { msg, .. } if msg.contains("no heading")));
+    }
+
+    #[test]
+    fn fill_rejects_duplicate_slot_fills() {
+        let mut doc = three_slots();
+        let mut p = plan(&["s0-c0"], RealignMode::None);
+        p.slides[0].fills.push(SlotFill { slot_id: "s0-c0".into(), heading: Some("A".into()), body: None });
+        p.slides[0].fills.push(SlotFill { slot_id: "s0-c0".into(), heading: Some("B".into()), body: None });
+        let err = apply_plan(&mut doc, &p).unwrap_err();
+        assert!(matches!(err, EngineError::BadParams { msg, .. } if msg.contains("more than once")));
+    }
+
+    #[test]
+    fn fill_and_delete_share_one_undo_entry() {
+        let mut s = session(three_slots());
+        let before = serde_json::to_vec(&*s.doc().unwrap().doc).unwrap();
+        let before_undo = undo_len(&s);
+        let res = s
+            .execute(
+                "ai.applyTemplatePlan",
+                &json!({"plan": {"slides": [{"index": 0, "keep_slot_ids": ["s0-c0", "s0-c2"], "fills": [{"slot_id": "s0-c0", "heading": "Why now", "body": "A\nB"}]}]}}),
+            )
+            .unwrap();
+        assert_eq!(res["slides"][0]["filled"], 1);
+        assert_eq!(undo_len(&s), before_undo + 1);
+        assert_eq!(s.doc().unwrap().doc.slides[0].shape(ShapeId(13)).unwrap().text.as_ref().unwrap().text(), "Why now");
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(serde_json::to_vec(&*s.doc().unwrap().doc).unwrap(), before);
+    }
+
+    #[test]
     fn connector_between_two_kept_is_preserved() {
         let mut doc = two_cards_with(vec![arrow(30, 345.0, 150.0, 40.0, 20.0)]);
         let res = apply_plan(&mut doc, &plan(&["s0-c0", "s0-c1"], RealignMode::None)).unwrap();
@@ -557,15 +793,29 @@ mod tests {
         let scan = scan::scan_slide(&doc, 6).unwrap();
         let keep: Vec<String> = scan.candidate_slots.iter().take(5).map(|s| s.id.clone()).collect();
         let dropped: usize = scan.candidate_slots.iter().skip(5).map(|s| s.children.len()).sum();
-        let plan =
-            ApplyPlan { slides: vec![ApplySlide { index: 6, keep_slot_ids: keep, realign: RealignMode::Auto, prune_orphan_connectors: true }] };
+        let first = &scan.candidate_slots[0];
+        let heading = first.heading.unwrap();
+        let body = first.body.unwrap();
+        let fills = vec![SlotFill {
+            slot_id: first.id.clone(),
+            heading: Some("Why now".into()),
+            body: Some("Market shift\nCustomer pain\nThird point".into()),
+        }];
+        let plan = ApplyPlan {
+            slides: vec![ApplySlide { index: 6, keep_slot_ids: keep, fills, realign: RealignMode::Auto, prune_orphan_connectors: true }],
+        };
         let res = apply_plan(&mut doc, &plan).unwrap();
         assert_eq!(res.slides[0].deleted, dropped + 4, "two connector groups and their children");
         assert_eq!((res.slides[0].moved, res.slides[0].rows_realigned), (4, 1));
+        assert_eq!(res.slides[0].filled, 1);
         for id in [85, 87] {
             assert!(doc.slides[6].shape(ShapeId(id)).is_none(), "orphan arrow {id} survived");
         }
         assert!(doc.slides[6].shape(ShapeId(83)).is_some(), "arrow 83 still bridges cards 37 and 47");
+        assert_eq!(doc.slides[6].shape(ShapeId(heading)).unwrap().text.as_ref().unwrap().text(), "Why now");
+        let filled_body = doc.slides[6].shape(ShapeId(body)).unwrap().text.as_ref().unwrap();
+        assert_eq!(filled_body.text(), "Market shift\nCustomer pain\nThird point");
+        assert_eq!(filled_body.paragraphs.len(), 3);
         println!("mud slide 6: {:?}", res.slides[0]);
     }
 
