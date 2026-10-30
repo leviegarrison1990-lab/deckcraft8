@@ -291,8 +291,13 @@ fn snippet(text: &str) -> String {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::*;
+    use std::sync::Arc;
+
+    use deckcraft_model::{ColorRef, Fill, LayoutId, Presentation, Rgba, Shape, ShapeId, ShapeKind, Size, Slide, SlideId, TextBody, Xfrm};
     use serde_json::json;
+
+    use super::*;
+    use crate::Session;
 
     #[test]
     fn key_prefers_the_deckcraft_name_then_the_nvidia_one() {
@@ -500,5 +505,201 @@ mod tests {
         })
         .unwrap();
         assert!(!plan.slides.is_empty());
+    }
+
+    const MOCK_CONTENT: &str = "# Slide 1: Rammed Earth Process\n- Soil testing\n- Formwork\n- Compaction\n- Curing";
+    const MOCK_BULLETS: [&str; 4] = ["Soil testing", "Formwork", "Compaction", "Curing"];
+    const MOCK_HEADINGS: [&str; 7] = [
+        "Soil Selection & Testing",
+        "Soil Preparation",
+        "Formwork Erection",
+        "Layer Placement",
+        "Surface Finishing",
+        "Formwork Removal & Curing",
+        "Compaction (Ramming)",
+    ];
+
+    fn mock_rect(x: f64, y: f64, w: f64, h: f64) -> Xfrm {
+        Xfrm::new(x, y, w, h)
+    }
+
+    fn mock_text(id: u32, x: f64, y: f64, w: f64, h: f64, value: &str) -> Shape {
+        Shape {
+            id: ShapeId(id),
+            xfrm: Some(mock_rect(x, y, w, h)),
+            text_box: true,
+            fill: Some(Fill::None),
+            text: Some(TextBody::from_text(value)),
+            ..Default::default()
+        }
+    }
+
+    fn mock_solid(id: u32, x: f64, y: f64, w: f64, h: f64) -> Shape {
+        Shape {
+            id: ShapeId(id),
+            xfrm: Some(mock_rect(x, y, w, h)),
+            fill: Some(Fill::solid(ColorRef::rgb(Rgba::rgb(224, 222, 218)))),
+            ..Default::default()
+        }
+    }
+
+    fn mock_group(id: u32, x: f64, y: f64, w: f64, h: f64, children: Vec<Shape>) -> Shape {
+        Shape {
+            id: ShapeId(id),
+            xfrm: Some(mock_rect(x, y, w, h)),
+            kind: ShapeKind::Group { children, child: mock_rect(0.0, 0.0, w, h) },
+            ..Default::default()
+        }
+    }
+
+    fn mock_card(shapes: &mut Vec<Shape>, base: u32, x: f64, y: f64, heading: &str) {
+        shapes.push(mock_group(base, x, y, 300.0, 220.0, vec![mock_solid(base + 1, 0.0, 0.0, 300.0, 220.0)]));
+        shapes.push(mock_text(base + 2, x + 15.0, y + 15.0, 270.0, 55.0, heading));
+        shapes.push(mock_text(base + 3, x + 15.0, y + 80.0, 270.0, 120.0, "Old body"));
+    }
+
+    fn mock_deck() -> Presentation {
+        let mut doc = Presentation { slide_size: Size::new(1440.0, 810.0), ..Default::default() };
+        doc.slides.clear();
+        let mut shapes = vec![mock_text(2, 40.0, 20.0, 900.0, 50.0, "Rammed Earth Construction Process")];
+        for (i, (x, y)) in
+            [(30.0, 140.0), (360.0, 140.0), (690.0, 140.0), (1020.0, 140.0), (240.0, 430.0), (570.0, 430.0), (900.0, 430.0)].into_iter().enumerate()
+        {
+            mock_card(&mut shapes, 10 + i as u32 * 10, x, y, MOCK_HEADINGS[i]);
+        }
+        let layout = doc.masters.first().and_then(|m| m.layouts.first()).map(|l| l.id).unwrap_or(LayoutId(0));
+        doc.slides.push(Arc::new(Slide { id: SlideId(200), layout, shapes, ..Default::default() }));
+        doc
+    }
+
+    fn mock_nim_response(scan: &SlideScan) -> String {
+        let keep: Vec<&str> = scan.candidate_slots.iter().take(5).map(|slot| slot.id.as_str()).collect();
+        assert_eq!(keep.len(), 5, "the canned plan keeps four bullet cards and one spare");
+        let fills: Vec<Value> =
+            keep.iter().take(MOCK_BULLETS.len()).zip(MOCK_BULLETS).map(|(slot_id, body)| json!({"slot_id": slot_id, "body": body})).collect();
+        let plan = json!({"slides": [{"index": scan.index, "keep_slot_ids": keep, "fills": fills}]});
+        json!({
+            "id": "chatcmpl-mocked",
+            "model": DEFAULT_MODEL,
+            "choices": [{"message": {"role": "assistant", "content": plan.to_string()}}]
+        })
+        .to_string()
+    }
+
+    fn mock_plan_from_markdown(scans: &[SlideScan]) -> (String, Value, TemplatePlan) {
+        let req = TemplatePlanRequest { content: MOCK_CONTENT, slides_from_scan: scans, model: None };
+        let outline = validate_template_request(&req).unwrap();
+        let ask = template_ask(&outline, scans).unwrap();
+        let body = build_body_with(TEMPLATE_SYSTEM_PROMPT, &ask, None, TEMPLATE_MAX_TOKENS);
+        let raw = mock_nim_response(&scans[0]);
+        let plan = parse_template_response(&raw, scans).unwrap();
+        (ask, body, plan)
+    }
+
+    fn mock_apply(doc: Presentation, plan: &TemplatePlan) -> (Arc<Presentation>, Value) {
+        let mut session = Session::with_new();
+        {
+            let state = session.doc_mut().unwrap();
+            state.doc = Arc::new(doc);
+            state.selection = Default::default();
+            state.history.undo.clear();
+            state.history.redo.clear();
+        }
+        let params = json!({"plan": serde_json::to_value(plan).unwrap()});
+        let result = session.execute("ai.applyTemplatePlan", &params).unwrap();
+        (Arc::clone(&session.doc().unwrap().doc), result)
+    }
+
+    fn mock_shape_text(doc: &Presentation, slide: usize, id: u32) -> String {
+        doc.slides[slide].shape(ShapeId(id)).unwrap().text.as_ref().unwrap().text()
+    }
+
+    #[test]
+    fn a_canned_nim_plan_flows_from_outline_through_apply_and_render() {
+        let doc = mock_deck();
+        let scans = [crate::ai::scan_slide(&doc, 0).unwrap()];
+        let ids: Vec<&str> = scans[0].candidate_slots.iter().map(|slot| slot.id.as_str()).collect();
+        assert_eq!(ids, ["s0-c0", "s0-c1", "s0-c2", "s0-c3", "s0-c4", "s0-c5", "s0-c6"]);
+        assert_eq!(scans[0].rows, [vec![10, 20, 30, 40], vec![50, 60, 70]]);
+
+        let (ask, body, plan) = mock_plan_from_markdown(&scans);
+        assert!(ask.contains("\"bullets\":[\"Soil testing\",\"Formwork\",\"Compaction\",\"Curing\"]"));
+        assert!(ask.contains("\"id\":\"s0-c0\""));
+        assert_eq!(body["model"], DEFAULT_MODEL);
+        assert_eq!(body["messages"][0]["content"], TEMPLATE_SYSTEM_PROMPT);
+        assert_eq!(body["messages"][1]["content"], ask);
+        assert_eq!(plan.slides[0].keep_slot_ids, ["s0-c0", "s0-c1", "s0-c2", "s0-c3", "s0-c4"]);
+        assert_eq!(plan.slides[0].fills.len(), 4);
+
+        let original: Vec<(String, String)> = scans[0]
+            .candidate_slots
+            .iter()
+            .map(|slot| (mock_shape_text(&doc, 0, slot.heading.unwrap()), mock_shape_text(&doc, 0, slot.body.unwrap())))
+            .collect();
+        let dropped_children: u64 = scans[0].candidate_slots[5..].iter().map(|slot| slot.children.len() as u64).sum();
+
+        let (doc, applied) = mock_apply(doc, &plan);
+        let slide_result = &applied["slides"][0];
+        assert_eq!(slide_result["filled"], 4);
+        assert!(slide_result["deleted"].as_u64().unwrap() >= dropped_children, "every dropped child must be counted");
+        assert!(slide_result["rows_realigned"].as_u64().unwrap() >= 1);
+
+        for (i, bullet) in MOCK_BULLETS.into_iter().enumerate() {
+            let slot = &scans[0].candidate_slots[i];
+            assert_eq!(mock_shape_text(&doc, 0, slot.heading.unwrap()), original[i].0, "heading {i} must keep its template style text");
+            assert_eq!(mock_shape_text(&doc, 0, slot.body.unwrap()), bullet, "body {i} must receive its bullet");
+        }
+        let spare = &scans[0].candidate_slots[4];
+        assert_eq!(mock_shape_text(&doc, 0, spare.heading.unwrap()), original[4].0);
+        assert_eq!(mock_shape_text(&doc, 0, spare.body.unwrap()), original[4].1);
+        for slot in &scans[0].candidate_slots[5..] {
+            for id in &slot.children {
+                assert!(doc.slides[0].shape(ShapeId(*id)).is_none(), "dropped child {id} survived");
+            }
+        }
+
+        let (png, width, height) = crate::cmd::file::render_png(&doc, 0, 2.0, false);
+        assert_eq!((width, height), (2880, 1620));
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    #[test]
+    #[ignore = "needs DECKCRAFT_TEST_PPTX; writes out/slide7-before.png and out/slide7-mocked.png"]
+    fn a_canned_nim_plan_renders_the_mud_slide_for_visual_comparison() {
+        let Some(path) = std::env::var_os("DECKCRAFT_TEST_PPTX") else { return };
+        let bytes = std::fs::read(path).unwrap();
+        let (doc, _) = deckcraft_pptx::import_checked(&bytes).unwrap();
+        let scans = [crate::ai::scan_slide(&doc, 6).unwrap()];
+        assert_eq!(scans[0].candidate_slots.len(), 7);
+        assert_eq!(scans[0].rows, [vec![7, 17, 27, 37], vec![47, 57, 67]]);
+        for slot in &scans[0].candidate_slots {
+            println!(
+                "{} bbox={:?} heading={:?} body={:?}",
+                slot.id,
+                slot.bbox,
+                mock_shape_text(&doc, 6, slot.heading.unwrap()),
+                mock_shape_text(&doc, 6, slot.body.unwrap())
+            );
+        }
+        let spare = &scans[0].candidate_slots[4];
+        let spare_heading = mock_shape_text(&doc, 6, spare.heading.unwrap());
+        let spare_body = mock_shape_text(&doc, 6, spare.body.unwrap());
+
+        let (before, width, height) = crate::cmd::file::render_png(&doc, 6, 2.0, false);
+        assert_eq!((width, height), (2880, 1620));
+
+        let (_ask, _body, plan) = mock_plan_from_markdown(&scans);
+        let (doc, applied) = mock_apply(doc, &plan);
+        assert_eq!(applied["slides"][0]["filled"], 4);
+        assert_eq!(mock_shape_text(&doc, 6, spare.heading.unwrap()), spare_heading);
+        assert_eq!(mock_shape_text(&doc, 6, spare.body.unwrap()), spare_body);
+        let (mocked, width, height) = crate::cmd::file::render_png(&doc, 6, 2.0, false);
+        assert_eq!((width, height), (2880, 1620));
+
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("slide7-before.png"), &before).unwrap();
+        std::fs::write(out.join("slide7-mocked.png"), &mocked).unwrap();
+        println!("wrote {} and {}; apply {applied}", out.join("slide7-before.png").display(), out.join("slide7-mocked.png").display());
     }
 }
