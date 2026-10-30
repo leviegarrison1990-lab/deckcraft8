@@ -10,6 +10,7 @@ use crate::ribbon::{cref_param, paint_anim_tile};
 use crate::theme::{self, Tokens};
 use crate::{SlideApp, widgets};
 
+mod ai;
 mod animation;
 mod background;
 mod comments;
@@ -18,6 +19,7 @@ mod format_shape;
 mod smartart;
 mod thesaurus;
 
+use ai::ai;
 use animation::animation;
 use background::background;
 use comments::{comments, revisions};
@@ -40,6 +42,7 @@ pub fn show(app: &mut SlideApp, ui: &mut Ui) {
         .show(ui, |ui| {
             app.ui.pane_width = ui.available_width() + 20.0;
             let title = match pane.as_str() {
+                "ai_ppt_maker" => "AI PPT Maker",
                 "format" => "Format Shape",
                 "background" => "Format Background",
                 "animation" => "Animation Pane",
@@ -66,6 +69,7 @@ pub fn show(app: &mut SlideApp, ui: &mut Ui) {
             });
             ui.add_space(6.0);
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match pane.as_str() {
+                "ai_ppt_maker" => ai(app, ui),
                 "format" => format_shape(app, ui),
                 "background" => background(app, ui),
                 "animation" => animation(app, ui),
