@@ -24,6 +24,9 @@ pub struct CandidateSlot {
     pub badge: Option<u32>,
     pub icons: Vec<u32>,
     pub children: Vec<u32>,
+    /// Members to move as a unit: the card plus its top-level shapes. Descendants are not
+    /// included because moving them directly would write child-space coordinates.
+    pub top_level_members: Vec<u32>,
     pub confidence: f32,
     pub flags: Vec<String>,
 }
@@ -105,9 +108,13 @@ pub fn scan_slide(doc: &Presentation, index: usize) -> Option<SlideScan> {
     for (ci, (card_id, bbox)) in cards.iter().enumerate() {
         let members = members_of(&ctx, &slide.shapes, *bbox, &card_ids);
         let mut children: Vec<u32> = vec![*card_id];
+        let mut top_level_members: Vec<u32> = vec![*card_id];
         for m in members {
             if !children.contains(&m) {
                 children.push(m);
+            }
+            if !top_level_members.contains(&m) {
+                top_level_members.push(m);
             }
             children.extend(descendants_of(&slide.shapes, m));
         }
@@ -141,6 +148,7 @@ pub fn scan_slide(doc: &Presentation, index: usize) -> Option<SlideScan> {
             badge,
             icons,
             children,
+            top_level_members,
             confidence,
             flags,
         });
@@ -558,6 +566,7 @@ mod tests {
         assert_eq!(scan.unclassified, [89]);
         assert_eq!(scan.candidate_slots.len(), 7);
         assert_eq!(scan.candidate_slots[0].children, [7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        assert_eq!(scan.candidate_slots[0].top_level_members, [7, 8, 10, 12, 15, 16]);
         for (i, slot) in scan.candidate_slots.iter().enumerate() {
             let base = 7 + 10 * i as u32;
             assert_eq!(slot.id, format!("s0-c{i}"));
@@ -690,6 +699,7 @@ mod tests {
         );
         let scan = scan_slide(&doc, 0).unwrap();
         assert_eq!(scan.candidate_slots[0].children, [10, 20, 21, 22]);
+        assert_eq!(scan.candidate_slots[0].top_level_members, [10, 20]);
     }
 
     #[test]

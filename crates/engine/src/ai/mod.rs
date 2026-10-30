@@ -1,9 +1,11 @@
+pub mod apply;
 pub mod plan;
 pub mod scan;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod nim;
 
+pub use apply::{ApplyPlan, ApplyResult, ApplySlide, RealignMode, SlideResult, apply_plan};
 pub use plan::{Plan, PlanRequest, PlanSlide};
 pub use scan::{CandidateSlot, SlideScan, scan_presentation, scan_slide};
 

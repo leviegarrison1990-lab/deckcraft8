@@ -1,6 +1,6 @@
 //! Edit menu: undo/redo, clipboard, duplicate, delete, select all.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use deckcraft_model::text::TextBody;
@@ -585,17 +585,23 @@ fn delete(s: &mut Session, p: &Value) -> Result<Value> {
         if sel.target == crate::Target::Slides
             && let Some(sl) = doc.slides.get_mut(sel.slide)
         {
-            let sl = Arc::make_mut(sl);
-            sl.animations.retain(|a| !gone.contains(&a.shape));
-            // Effects triggered by a deleted shape fall back to the main sequence.
-            for a in sl.animations.iter_mut().filter(|a| a.trigger.is_some_and(|t| gone.contains(&t))) {
-                a.trigger = None;
-            }
+            let deleted: HashSet<ShapeId> = gone.into_iter().collect();
+            cleanup_deleted(Arc::make_mut(sl), &deleted);
         }
         sel.shapes.retain(|i| !ids.contains(i));
         sel.text = None;
         Ok(json!({"deleted": n}))
     })
+}
+
+/// Drop animations and clear triggers that reference deleted shapes.
+/// Shared by `edit.delete` and `ai.applyTemplatePlan` so both leave the same clean state.
+pub(crate) fn cleanup_deleted(slide: &mut Slide, deleted: &HashSet<ShapeId>) {
+    slide.animations.retain(|a| !deleted.contains(&a.shape));
+    // Effects triggered by a deleted shape fall back to the main sequence.
+    for a in slide.animations.iter_mut().filter(|a| a.trigger.is_some_and(|t| deleted.contains(&t))) {
+        a.trigger = None;
+    }
 }
 
 /// Remove shapes by id anywhere in the tree; empty groups go too.

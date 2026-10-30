@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 
-use super::{CommandSpec, always, bad, cmd, opt_usize_param, str_param};
+use super::{CommandSpec, always, bad, cmd, has_doc, opt_usize_param, str_param};
 use crate::ai::{PlanRequest, plan as plan_with_ai};
 use crate::{EngineError, Result, Session};
 
@@ -20,9 +20,18 @@ pub fn specs() -> Vec<CommandSpec> {
             "Scan PPTX Template",
             [],
             None,
-            "{pptx: base64, slides?: [int]} → {slides: [SlideScan], warnings: [string]}",
+            "{pptx: base64, slides?: [int]} -> {slides: [SlideScan], warnings: [string]}",
             always,
             template_scan
+        ),
+        cmd!(
+            "ai.applyTemplatePlan",
+            "Apply Template Plan",
+            [],
+            None,
+            "{plan: {slides: [{index, keep_slot_ids: [string], realign?: auto|none}]}} -> {slides: [{index, deleted, moved, rows_realigned}]}",
+            has_doc,
+            apply_cmd
         ),
     ]
 }
@@ -45,6 +54,15 @@ fn template_scan(_s: &mut Session, p: &Value) -> Result<Value> {
         p.get("slides").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as usize)).collect());
     let out: Vec<_> = scans.into_iter().filter(|s| filter.as_ref().is_none_or(|f| f.contains(&s.index))).collect();
     Ok(json!({"slides": out, "warnings": warnings}))
+}
+
+fn apply_cmd(s: &mut Session, p: &Value) -> Result<Value> {
+    let plan_val = p.get("plan").cloned().ok_or_else(|| bad("ai.applyTemplatePlan", "missing `plan`"))?;
+    let plan: crate::ai::ApplyPlan = serde_json::from_value(plan_val).map_err(|e| bad("ai.applyTemplatePlan", format!("bad plan: {e}")))?;
+    s.edit(|doc, _sel| {
+        let res = crate::ai::apply::apply_plan(doc, &plan)?;
+        serde_json::to_value(res).map_err(|e| EngineError::Other(format!("serialize apply result: {e}")))
+    })
 }
 
 #[cfg(test)]
