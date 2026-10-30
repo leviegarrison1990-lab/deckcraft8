@@ -130,6 +130,9 @@ pub(super) fn insert(app: &mut SlideApp, ui: &mut Ui) {
         big(app, ui, Icon::Video, "Video", "app.insertVideoDialog", json!({}));
         big(app, ui, Icon::Audio, "Audio", "app.insertAudioDialog", json!({}));
     });
+    group(ui, |ui| {
+        big(app, ui, Icon::Sparkle, "AI PPT\nMaker", "view.pane", json!({"pane": "ai_ppt_maker", "toggle": true}));
+    });
 }
 
 /// Hover-to-size table grid. Returns (rows, cols) when clicked.
@@ -271,4 +274,39 @@ pub(super) fn chart_menu_types() -> Vec<Option<deckcraft_model::chart::ChartType
     v.push(None);
     v.extend(ChartType::OFFICE_2016.iter().copied().filter(|k| !ChartType::MAIN.contains(k)).map(Some));
     v
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+
+    use crate::{Services, SlideApp};
+
+    #[test]
+    fn the_ai_button_toggles_the_pane_and_it_survives_a_tab_switch() {
+        let mut app = SlideApp::new(deckcraft_engine::Session::with_new(), Services::default());
+        app.ui.tab = "Insert".into();
+        let mut h = Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+            |ui, app: &mut SlideApp| {
+                app.logic(ui.ctx());
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(2);
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "AI PPT Maker").click();
+        h.run_steps(2);
+        assert_eq!(h.state().ui.pane.as_deref(), Some("ai_ppt_maker"));
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "AI PPT Maker").click();
+        h.run_steps(2);
+        assert_eq!(h.state().ui.pane, None);
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "AI PPT Maker").click();
+        h.run_steps(2);
+        h.state_mut().ui.tab = "Home".into();
+        h.run_steps(2);
+        assert_eq!(h.state().ui.pane.as_deref(), Some("ai_ppt_maker"));
+    }
 }
