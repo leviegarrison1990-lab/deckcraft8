@@ -60,7 +60,7 @@ pub(super) fn ai(app: &mut SlideApp, ui: &mut Ui) {
                 app.cancel_ai_plan();
             }
         });
-        ui.label(egui::RichText::new("This can take up to 30 seconds.").size(11.5).color(t.text_dim));
+        ui.label(egui::RichText::new("This can take up to 2 minutes.").size(11.5).color(t.text_dim));
     } else {
         let ready = !app.ai.content.trim().is_empty() && app.session.active().is_some();
         ui.horizontal(|ui| {
