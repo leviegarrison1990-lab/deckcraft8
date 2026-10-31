@@ -40,6 +40,7 @@ pub struct TemplatePlan {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TemplatePlanSlide {
     pub index: usize,
+    #[serde(alias = "keep")]
     pub keep_slot_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fills: Vec<SlotFill>,
@@ -47,10 +48,11 @@ pub struct TemplatePlanSlide {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotFill {
+    #[serde(alias = "slot")]
     pub slot_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "h", default, skip_serializing_if = "Option::is_none")]
     pub heading: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "b", default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
 }
 

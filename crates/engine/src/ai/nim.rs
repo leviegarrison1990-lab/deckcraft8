@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 use super::plan::{OutlineSlide, Plan, PlanRequest, SlotFill, TemplatePlan, TemplatePlanRequest, TemplatePlanSlide, parse_outline};
@@ -15,7 +15,7 @@ const MAX_PROMPT: usize = 32 * 1024;
 const MAX_CONTENT: usize = 32 * 1024;
 const MAX_TEMPLATE_PROMPT: usize = 64 * 1024;
 const MAX_TEMPLATE_SLIDES: usize = 64;
-const TEMPLATE_MAX_TOKENS: u32 = 4096;
+const TEMPLATE_MAX_TOKENS: u32 = 8192;
 const MAX_REPORTED: usize = 500;
 const TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -29,23 +29,27 @@ Rules:
 Example:
 {"slides":[{"title":"Why now","bullets":["Market shift","Customer pain","Our opening"],"layout":"titleContent"}]}"#;
 
-const TEMPLATE_SYSTEM_PROMPT: &str = r#"You fit an already-segmented slide outline onto a scanned presentation template. Return only one JSON object with exactly one top-level "slides" array and this exact shape:
-{"slides":[{"index":0,"keep_slot_ids":["s0-c0","s0-c1"],"fills":[{"slot_id":"s0-c0","heading":"Why now","body":"Market shift\nCustomer pain"}]}]}
+const TEMPLATE_SYSTEM_PROMPT: &str = r#"You fit an already-segmented slide outline onto a scanned presentation template. Return only one JSON object with exactly one top-level "slides" array. Output strictly:
+{"slides":[{"keep":["s6-c0",...],"fills":[{"slot":"s6-c0","h":"Heading","b":"Body or omit"}]}]}
 Rules:
-- "index" is a template slide index from the scan; include each index at most once, in one entry.
-- "keep_slot_ids" are candidate slot ids on that template slide. Keep only the slots needed for the outline. Never invent an index or slot id.
+- Each entry is one template slide. Do not output an index field; the template slide is identified by the slot ids in "keep" (the number after "s").
+- All "keep" slot ids in one entry must belong to the same template slide. Never invent a slot id.
+- "keep" lists candidate slot ids on that template slide. Keep only the slots needed for the outline.
 - Keep 1-6 slots on every returned slide; never split one template slide into multiple entries. Keep one slot per outline bullet and drop extra cards; the slide title is not a bullet and needs no card.
-- Prefer a complete row only when it does not add cards beyond the bullet count.
+- Plan exactly one template slide per content section, in the same order as the content sections.
+- Never put two content sections on the same template slide, and never split one content section across template slides.
+- Include only slides you are keeping. No empty slides, no commentary, no prose before or after the JSON.
+- One card = one bullet. Do not split a bullet across cards or merge bullets.
+- Omit "b" when the source outline has no supporting detail.
+- Every fill must name a slot in that slide's "keep" and must contain exactly "slot", "h", and optional "b".
+- Give each kept slot a short heading and an optional body. Put body points on separate lines with \n.
+- Never repeat the same text in a heading and its body.
+- Preserve the user's wording when possible; do not invent facts.
 - Use the scan's layout, visible_title, candidate slot bboxes, and rows to choose the best template slides.
 - Account for the content: include enough template slides and slots for every outline slide. Do not drop facts, numbers, or names.
-- "fills" is optional. Every fill must name a slot in that slide's "keep_slot_ids".
-- Give each kept slot a short heading and an optional body. Put body points on separate lines with \n; if there is no supporting detail, set "body" to "".
-- Never repeat the same text in a heading and its body.
-- Spread the outline's points across the kept slots: one point per card when there are enough cards; do not put the whole outline in one card unless only one slot is kept.
-- Preserve the user's wording when possible; do not invent facts.
-- Do not add prose, markdown fences, comments, extra keys, or duplicate keys.
+- Compact JSON only. No indentation, no trailing comments.
 Example:
-{"slides":[{"index":0,"keep_slot_ids":["s0-c0","s0-c1"],"fills":[{"slot_id":"s0-c0","heading":"Why now","body":"Market shift\nCustomer pain"},{"slot_id":"s0-c1","heading":"What next","body":"Ship beta\nHire two AEs"}]}]}"#;
+{"slides":[{"keep":["s0-c0","s0-c1"],"fills":[{"slot":"s0-c0","h":"Why now","b":"Market shift\nCustomer pain"},{"slot":"s0-c1","h":"What next","b":"Ship beta\nHire two AEs"}]}]}"#;
 
 pub(super) fn plan(req: PlanRequest<'_>) -> Result<Plan> {
     validate(&req)?;
@@ -56,8 +60,26 @@ pub(super) fn plan(req: PlanRequest<'_>) -> Result<Plan> {
 pub(super) fn plan_template(req: TemplatePlanRequest<'_>) -> Result<TemplatePlan> {
     let outline = validate_template_request(&req)?;
     let ask = template_ask(&outline, req.slides_from_scan)?;
-    let raw = post(build_body_with(TEMPLATE_SYSTEM_PROMPT, &ask, req.model, TEMPLATE_MAX_TOKENS))?;
-    parse_template_response(&raw, req.slides_from_scan)
+    let raw = post(build_template_body(&ask, req.model))?;
+    let plan = parse_template_response(&raw, req.slides_from_scan)?;
+    validate_template_coverage(&plan, &outline)?;
+    Ok(plan)
+}
+
+fn validate_template_coverage(plan: &TemplatePlan, outline: &[OutlineSlide]) -> Result<()> {
+    if plan.slides.len() != outline.len() {
+        return Err(EngineError::Other(format!(
+            "NVIDIA planned {} template slides for {} content sections; expected exactly one template slide per content section",
+            plan.slides.len(),
+            outline.len()
+        )));
+    }
+    let bullets: usize = outline.iter().map(|slide| slide.bullets.len()).sum();
+    let fills: usize = plan.slides.iter().map(|slide| slide.fills.len()).sum();
+    if fills < bullets {
+        return Err(EngineError::Other(format!("NVIDIA planned {fills} card fills for {bullets} outline bullets; one card must hold one bullet")));
+    }
+    Ok(())
 }
 
 fn post(body: Value) -> Result<String> {
@@ -119,6 +141,27 @@ fn build_body(req: &PlanRequest<'_>) -> Value {
 }
 
 fn build_body_with(system: &str, ask: &str, model: Option<&str>, max_tokens: u32) -> Value {
+    build_body_with_format(system, ask, model, max_tokens, json!({"type": "json_object"}))
+}
+
+fn build_template_body(ask: &str, model: Option<&str>) -> Value {
+    build_body_with_format(
+        TEMPLATE_SYSTEM_PROMPT,
+        ask,
+        model,
+        TEMPLATE_MAX_TOKENS,
+        json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "template_plan",
+                "strict": true,
+                "schema": template_plan_schema()
+            }
+        }),
+    )
+}
+
+fn build_body_with_format(system: &str, ask: &str, model: Option<&str>, max_tokens: u32, response_format: Value) -> Value {
     json!({
         "model": model.unwrap_or(DEFAULT_MODEL),
         "messages": [
@@ -127,8 +170,42 @@ fn build_body_with(system: &str, ask: &str, model: Option<&str>, max_tokens: u32
         ],
         "temperature": 0.2,
         "max_tokens": max_tokens,
-        "response_format": {"type": "json_object"},
+        "response_format": response_format,
         "chat_template_kwargs": {"enable_thinking": false}
+    })
+}
+
+fn template_plan_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["slides"],
+        "properties": {
+            "slides": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_TEMPLATE_SLIDES,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["keep", "fills"],
+                    "properties": {
+                        "keep": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 6,
+                            "items": {"type": "string"}
+                        },
+                        "fills": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 6,
+                            "items": {"type": "object"}
+                        }
+                    }
+                }
+            }
+        }
     })
 }
 
@@ -194,10 +271,54 @@ fn parse_response(raw: &str) -> Result<Plan> {
 
 fn parse_template_response(raw: &str, scans: &[SlideScan]) -> Result<TemplatePlan> {
     let content = response_content(raw)?;
-    let plan = parse_content_as::<TemplatePlan>(&content, "a template plan").map_err(EngineError::Other)?;
+    let plan = parse_content_as::<TemplatePlanWire>(&content, "a template plan").map_err(EngineError::Other)?;
+    let plan = plan.into_plan()?;
     let plan = coalesce_template_plan(plan);
     validate_template_plan(scans, &plan)?;
     Ok(plan)
+}
+
+#[derive(Deserialize)]
+struct TemplatePlanWire {
+    slides: Vec<TemplatePlanSlideWire>,
+}
+
+#[derive(Deserialize)]
+struct TemplatePlanSlideWire {
+    #[serde(alias = "keep")]
+    keep_slot_ids: Vec<String>,
+    #[serde(default)]
+    fills: Vec<SlotFill>,
+}
+
+impl TemplatePlanWire {
+    fn into_plan(self) -> Result<TemplatePlan> {
+        let mut slides = Vec::with_capacity(self.slides.len());
+        for slide in self.slides {
+            let index = infer_slide_index(&slide.keep_slot_ids)?;
+            slides.push(TemplatePlanSlide { index, keep_slot_ids: slide.keep_slot_ids, fills: slide.fills });
+        }
+        Ok(TemplatePlan { slides })
+    }
+}
+
+fn infer_slide_index(keep_slot_ids: &[String]) -> Result<usize> {
+    let Some(first) = keep_slot_ids.first() else {
+        return Err(EngineError::Other("NVIDIA plan keeps no slots".into()));
+    };
+    let Some(index) = slide_index_from_slot(first) else {
+        return Err(EngineError::Other(format!("NVIDIA plan has unknown slot `{first}`")));
+    };
+    if keep_slot_ids.iter().any(|id| slide_index_from_slot(id) != Some(index)) {
+        return Err(EngineError::Other(format!("NVIDIA plan mixes template slides in one entry: {}", keep_slot_ids.join(", "))));
+    }
+    Ok(index)
+}
+
+fn slide_index_from_slot(slot_id: &str) -> Option<usize> {
+    let rest = slot_id.strip_prefix('s')?;
+    let (index, card) = rest.split_once('-')?;
+    if card.is_empty() { None } else { index.parse().ok() }
 }
 
 fn coalesce_template_plan(plan: TemplatePlan) -> TemplatePlan {
@@ -466,15 +587,29 @@ mod tests {
     fn template_body_uses_the_template_prompt_and_scanned_data() {
         let outline = parse_outline("# Slide 1: Why now\n- Market shift");
         let ask = template_ask(&outline, &[scan(6, &["s6-c0", "s6-c1"])]).unwrap();
-        let body = build_body_with(TEMPLATE_SYSTEM_PROMPT, &ask, None, TEMPLATE_MAX_TOKENS);
+        let body = build_template_body(&ask, None);
         assert_eq!(body["model"], DEFAULT_MODEL);
         assert_eq!(body["max_tokens"], TEMPLATE_MAX_TOKENS);
-        assert_eq!(body["response_format"]["type"], "json_object");
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["response_format"]["json_schema"]["name"], "template_plan");
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(body["response_format"]["json_schema"]["schema"]["required"], json!(["slides"]));
+        assert!(body["response_format"]["json_schema"]["schema"]["properties"]["slides"]["items"]["properties"].get("index").is_none());
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
         assert_eq!(body["messages"][0]["content"], TEMPLATE_SYSTEM_PROMPT);
         let user = body["messages"][1]["content"].as_str().unwrap();
         assert!(user.contains("\"title\":\"Why now\""));
         assert!(user.contains("\"id\":\"s6-c0\""));
+    }
+
+    #[test]
+    fn template_schema_avoids_unsupported_grammar_keys() {
+        let schema = template_plan_schema();
+        let text = schema.to_string();
+        assert!(!text.contains("uniqueItems"), "NIM rejects uniqueItems");
+        assert_eq!(schema["properties"]["slides"]["items"]["required"], json!(["keep", "fills"]));
+        assert!(schema["properties"]["slides"]["items"]["properties"].get("index").is_none());
+        assert_eq!(schema["properties"]["slides"]["items"]["properties"]["fills"]["items"], json!({"type": "object"}));
     }
 
     #[test]
@@ -494,6 +629,90 @@ mod tests {
         assert_eq!(plan.slides.len(), 1);
         assert_eq!(plan.slides[0].fills.len(), 2);
         assert_eq!(plan.slides[0].fills[1].body.as_deref(), Some("Two\nThree"));
+    }
+
+    #[test]
+    fn parses_compact_template_plan_keys() {
+        let scans = [scan(6, &["s6-c0", "s6-c1"])];
+        let raw = template_envelope(template_plan(json!([
+            {
+                "keep": ["s6-c0", "s6-c1"],
+                "fills": [
+                    {"slot": "s6-c0", "h": "Now"},
+                    {"slot": "s6-c1", "h": "Next", "b": "Two\nThree"}
+                ]
+            }
+        ])));
+        let plan = parse_template_response(&raw, &scans).unwrap();
+        assert_eq!(plan.slides[0].index, 6);
+        assert_eq!(plan.slides[0].keep_slot_ids, ["s6-c0", "s6-c1"]);
+        assert_eq!(plan.slides[0].fills[0].slot_id, "s6-c0");
+        assert_eq!(plan.slides[0].fills[0].heading.as_deref(), Some("Now"));
+        assert_eq!(plan.slides[0].fills[0].body, None);
+        assert_eq!(plan.slides[0].fills[1].body.as_deref(), Some("Two\nThree"));
+    }
+
+    #[test]
+    fn infers_each_template_slide_from_its_slot_ids() {
+        let scans = [scan(6, &["s6-c0"]), scan(7, &["s7-c0"])];
+        let raw = template_envelope(template_plan(json!([
+            {"keep": ["s7-c0"], "fills": [{"slot": "s7-c0", "h": "Next"}]},
+            {"keep": ["s6-c0"], "fills": [{"slot": "s6-c0", "h": "Now"}]}
+        ])));
+        let plan = parse_template_response(&raw, &scans).unwrap();
+        assert_eq!(plan.slides.iter().map(|slide| slide.index).collect::<Vec<_>>(), [7, 6]);
+    }
+
+    #[test]
+    fn template_prompt_asks_for_compact_json_and_one_slide_per_section() {
+        for needle in [
+            "\"keep\":",
+            "\"slot\":",
+            "\"h\":",
+            "\"b\":",
+            "Plan exactly one template slide per content section",
+            "Never put two content sections on the same template slide",
+            "Omit \"b\"",
+            "Compact JSON only.",
+        ] {
+            assert!(TEMPLATE_SYSTEM_PROMPT.contains(needle), "prompt is missing {needle}");
+        }
+        assert!(!TEMPLATE_SYSTEM_PROMPT.contains("keep_slot_ids"));
+        assert!(!TEMPLATE_SYSTEM_PROMPT.contains("slot_id"));
+        assert!(!TEMPLATE_SYSTEM_PROMPT.contains("\"heading\":"));
+        assert!(!TEMPLATE_SYSTEM_PROMPT.contains("\"index\":"));
+        assert!(TEMPLATE_SYSTEM_PROMPT.contains("Do not output an index field"));
+        assert_eq!(TEMPLATE_MAX_TOKENS, 8192);
+    }
+
+    #[test]
+    fn coverage_requires_one_slide_per_section_and_one_fill_per_bullet() {
+        let outline = parse_outline("# Slide 1: A\n- a\n- b\n# Slide 2: B\n- c");
+        let merged_sections: TemplatePlan = serde_json::from_value(json!({"slides": [{
+            "index": 0,
+            "keep_slot_ids": ["s0-c0", "s0-c1"],
+            "fills": [{"slot_id": "s0-c0", "heading": "A"}, {"slot_id": "s0-c1", "heading": "B"}]
+        }]}))
+        .unwrap();
+        assert!(validate_template_coverage(&merged_sections, &outline).is_err());
+
+        let merged_bullets: TemplatePlan = serde_json::from_value(json!({"slides": [
+            {"index": 0, "keep_slot_ids": ["s0-c0"], "fills": [{"slot_id": "s0-c0", "heading": "A"}]},
+            {"index": 1, "keep_slot_ids": ["s1-c0"], "fills": [{"slot_id": "s1-c0", "heading": "B"}]}
+        ]}))
+        .unwrap();
+        assert!(validate_template_coverage(&merged_bullets, &outline).is_err());
+
+        let good: TemplatePlan = serde_json::from_value(json!({"slides": [
+            {
+                "index": 0,
+                "keep_slot_ids": ["s0-c0", "s0-c1"],
+                "fills": [{"slot_id": "s0-c0", "heading": "A"}, {"slot_id": "s0-c1", "heading": "B"}]
+            },
+            {"index": 1, "keep_slot_ids": ["s1-c0"], "fills": [{"slot_id": "s1-c0", "heading": "C"}]}
+        ]}))
+        .unwrap();
+        assert!(validate_template_coverage(&good, &outline).is_ok());
     }
 
     #[test]
@@ -579,12 +798,12 @@ mod tests {
 
     #[test]
     fn template_plan_rejects_unknown_or_misused_ids() {
-        let scans = [scan(6, &["s6-c0"])];
+        let scans = [scan(6, &["s6-c0"]), scan(7, &["s7-c0"])];
         for slides in [
-            json!([{"index": 7, "keep_slot_ids": ["s6-c0"]}]),
-            json!([{"index": 6, "keep_slot_ids": ["s6-c9"]}]),
-            json!([{"index": 6, "keep_slot_ids": ["s6-c0"], "fills": [{"slot_id": "s6-c9"}]}]),
-            json!([{"index": 6, "keep_slot_ids": ["s6-c0"], "fills": [{"slot_id": "s6-c0"}, {"slot_id": "s6-c0"}]}]),
+            json!([{"keep_slot_ids": ["s6-c0", "s7-c0"]}]),
+            json!([{"keep_slot_ids": ["s6-c9"]}]),
+            json!([{"keep_slot_ids": ["s6-c0"], "fills": [{"slot_id": "s6-c9"}]}]),
+            json!([{"keep_slot_ids": ["s6-c0"], "fills": [{"slot_id": "s6-c0"}, {"slot_id": "s6-c0"}]}]),
         ] {
             let raw = template_envelope(template_plan(slides));
             assert!(parse_template_response(&raw, &scans).is_err());
@@ -714,7 +933,7 @@ mod tests {
         let req = TemplatePlanRequest { content: MOCK_CONTENT, slides_from_scan: scans, model: None };
         let outline = validate_template_request(&req).unwrap();
         let ask = template_ask(&outline, scans).unwrap();
-        let body = build_body_with(TEMPLATE_SYSTEM_PROMPT, &ask, None, TEMPLATE_MAX_TOKENS);
+        let body = build_template_body(&ask, None);
         let raw = mock_nim_response(&scans[0]);
         let plan = parse_template_response(&raw, scans).unwrap();
         (ask, body, plan)
