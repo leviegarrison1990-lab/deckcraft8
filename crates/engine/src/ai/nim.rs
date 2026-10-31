@@ -34,19 +34,18 @@ const TEMPLATE_SYSTEM_PROMPT: &str = r#"You fit an already-segmented slide outli
 Rules:
 - Each entry is one template slide. Do not output an index field; the template slide is identified by the slot ids in "keep" (the number after "s").
 - All "keep" slot ids in one entry must belong to the same template slide. Never invent a slot id.
-- "keep" lists candidate slot ids on that template slide. Keep only the slots needed for the outline.
-- Keep 1-6 slots on every returned slide; never split one template slide into multiple entries. Keep one slot per outline bullet and drop extra cards; the slide title is not a bullet and needs no card.
-- Plan exactly one template slide per content section, in the same order as the content sections.
-- Never put two content sections on the same template slide, and never split one content section across template slides.
+- Map each content section to exactly one card. Put that section's bullets in the card body, one bullet per line. Never merge two sections into one card and never split one section across cards.
+- Prefer one template slide whose card count fits the number of content sections. Consolidate all sections onto that slide when it has at least one card per section; do not leave a slide mostly empty.
+- Use distinct template slides only when the sections are structurally different (for example title, body, chart, or table) and no single slide fits them well.
+- "keep" lists candidate slot ids on each returned slide. Keep exactly the cards you fill and drop extra cards; the slide title is not a card.
 - Include only slides you are keeping. No empty slides, no commentary, no prose before or after the JSON.
-- One card = one bullet. Do not split a bullet across cards or merge bullets.
-- Omit "b" when the source outline has no supporting detail.
+- Omit "b" when the source section has no bullets.
 - Every fill must name a slot in that slide's "keep" and must contain exactly "slot", "h", and optional "b".
-- Give each kept slot a short heading and an optional body. Put body points on separate lines with \n.
+- Give each filled card a short heading and its section's bullets as separate lines in the body.
 - Never repeat the same text in a heading and its body.
 - Preserve the user's wording when possible; do not invent facts.
-- Use the scan's layout, visible_title, candidate slot bboxes, and rows to choose the best template slides.
-- Account for the content: include enough template slides and slots for every outline slide. Do not drop facts, numbers, or names.
+- Use the scan's layout, visible_title, candidate slot bboxes, and rows to choose the best template slide.
+- Account for the content: every section's heading and every bullet must appear in the plan. Do not drop facts, numbers, or names.
 - Compact JSON only. No indentation, no trailing comments.
 Example:
 {"slides":[{"keep":["s0-c0","s0-c1"],"fills":[{"slot":"s0-c0","h":"Why now","b":"Market shift\nCustomer pain"},{"slot":"s0-c1","h":"What next","b":"Ship beta\nHire two AEs"}]}]}"#;
@@ -67,17 +66,27 @@ pub(super) fn plan_template(req: TemplatePlanRequest<'_>) -> Result<TemplatePlan
 }
 
 fn validate_template_coverage(plan: &TemplatePlan, outline: &[OutlineSlide]) -> Result<()> {
-    if plan.slides.len() != outline.len() {
+    let fills: Vec<&SlotFill> = plan.slides.iter().flat_map(|slide| slide.fills.iter()).collect();
+    if fills.len() != outline.len() {
         return Err(EngineError::Other(format!(
-            "NVIDIA planned {} template slides for {} content sections; expected exactly one template slide per content section",
-            plan.slides.len(),
+            "NVIDIA planned {} card fills for {} content sections; expected exactly one card per content section",
+            fills.len(),
             outline.len()
         )));
     }
-    let bullets: usize = outline.iter().map(|slide| slide.bullets.len()).sum();
-    let fills: usize = plan.slides.iter().map(|slide| slide.fills.len()).sum();
-    if fills < bullets {
-        return Err(EngineError::Other(format!("NVIDIA planned {fills} card fills for {bullets} outline bullets; one card must hold one bullet")));
+    for (position, (section, fill)) in outline.iter().zip(fills).enumerate() {
+        let has_heading = fill.heading.as_deref().is_some_and(|heading| !heading.trim().is_empty());
+        if !has_heading {
+            return Err(EngineError::Other(format!("NVIDIA left content section {} without a card heading", position + 1)));
+        }
+        let lines = fill.body.as_deref().map(|body| body.lines().filter(|line| !line.trim().is_empty()).count()).unwrap_or(0);
+        if lines < section.bullets.len() {
+            return Err(EngineError::Other(format!(
+                "NVIDIA planned {lines} bullet lines on card {} for {} outline bullets; put every bullet in the section's card body",
+                position + 1,
+                section.bullets.len()
+            )));
+        }
     }
     Ok(())
 }
@@ -664,19 +673,24 @@ mod tests {
     }
 
     #[test]
-    fn template_prompt_asks_for_compact_json_and_one_slide_per_section() {
+    fn template_prompt_maps_sections_to_cards_and_allows_consolidation() {
         for needle in [
             "\"keep\":",
             "\"slot\":",
             "\"h\":",
             "\"b\":",
-            "Plan exactly one template slide per content section",
-            "Never put two content sections on the same template slide",
+            "Map each content section to exactly one card",
+            "Prefer one template slide whose card count fits",
+            "Consolidate all sections onto that slide",
+            "Use distinct template slides only when",
             "Omit \"b\"",
             "Compact JSON only.",
         ] {
             assert!(TEMPLATE_SYSTEM_PROMPT.contains(needle), "prompt is missing {needle}");
         }
+        assert!(!TEMPLATE_SYSTEM_PROMPT.contains("Plan exactly one template slide per content section"));
+        assert!(!TEMPLATE_SYSTEM_PROMPT.contains("Never put two content sections on the same template slide"));
+        assert!(!TEMPLATE_SYSTEM_PROMPT.contains("one card = one bullet"));
         assert!(!TEMPLATE_SYSTEM_PROMPT.contains("keep_slot_ids"));
         assert!(!TEMPLATE_SYSTEM_PROMPT.contains("slot_id"));
         assert!(!TEMPLATE_SYSTEM_PROMPT.contains("\"heading\":"));
@@ -686,33 +700,59 @@ mod tests {
     }
 
     #[test]
-    fn coverage_requires_one_slide_per_section_and_one_fill_per_bullet() {
-        let outline = parse_outline("# Slide 1: A\n- a\n- b\n# Slide 2: B\n- c");
+    fn coverage_accepts_consolidated_sections_and_checks_each_card() {
+        let outline = parse_outline("# Slide 1: A\n- a\n- b\n# Slide 2: B\n- c\n# Slide 3: C\n- d\n- e\n- f");
+        let consolidated: TemplatePlan = serde_json::from_value(json!({"slides": [{
+            "index": 0,
+            "keep_slot_ids": ["s0-c0", "s0-c1", "s0-c2"],
+            "fills": [
+                {"slot_id": "s0-c0", "heading": "A", "body": "a\nb"},
+                {"slot_id": "s0-c1", "heading": "B", "body": "c"},
+                {"slot_id": "s0-c2", "heading": "C", "body": "d\ne\nf"}
+            ]
+        }]}))
+        .unwrap();
+        assert!(validate_template_coverage(&consolidated, &outline).is_ok());
+
+        let distinct: TemplatePlan = serde_json::from_value(json!({"slides": [
+            {"index": 0, "keep_slot_ids": ["s0-c0"], "fills": [{"slot_id": "s0-c0", "heading": "A", "body": "a\nb"}]},
+            {"index": 1, "keep_slot_ids": ["s1-c0"], "fills": [{"slot_id": "s1-c0", "heading": "B", "body": "c"}]},
+            {"index": 2, "keep_slot_ids": ["s2-c0"], "fills": [{"slot_id": "s2-c0", "heading": "C", "body": "d\ne\nf"}]}
+        ]}))
+        .unwrap();
+        assert!(validate_template_coverage(&distinct, &outline).is_ok());
+
         let merged_sections: TemplatePlan = serde_json::from_value(json!({"slides": [{
             "index": 0,
-            "keep_slot_ids": ["s0-c0", "s0-c1"],
-            "fills": [{"slot_id": "s0-c0", "heading": "A"}, {"slot_id": "s0-c1", "heading": "B"}]
+            "keep_slot_ids": ["s0-c0"],
+            "fills": [{"slot_id": "s0-c0", "heading": "A, B, C", "body": "a\nb\nc\nd\ne\nf"}]
         }]}))
         .unwrap();
         assert!(validate_template_coverage(&merged_sections, &outline).is_err());
 
-        let merged_bullets: TemplatePlan = serde_json::from_value(json!({"slides": [
-            {"index": 0, "keep_slot_ids": ["s0-c0"], "fills": [{"slot_id": "s0-c0", "heading": "A"}]},
-            {"index": 1, "keep_slot_ids": ["s1-c0"], "fills": [{"slot_id": "s1-c0", "heading": "B"}]}
-        ]}))
+        let merged_bullets: TemplatePlan = serde_json::from_value(json!({"slides": [{
+            "index": 0,
+            "keep_slot_ids": ["s0-c0", "s0-c1", "s0-c2"],
+            "fills": [
+                {"slot_id": "s0-c0", "heading": "A", "body": "a"},
+                {"slot_id": "s0-c1", "heading": "B", "body": "c"},
+                {"slot_id": "s0-c2", "heading": "C", "body": "d\ne\nf"}
+            ]
+        }]}))
         .unwrap();
         assert!(validate_template_coverage(&merged_bullets, &outline).is_err());
 
-        let good: TemplatePlan = serde_json::from_value(json!({"slides": [
-            {
-                "index": 0,
-                "keep_slot_ids": ["s0-c0", "s0-c1"],
-                "fills": [{"slot_id": "s0-c0", "heading": "A"}, {"slot_id": "s0-c1", "heading": "B"}]
-            },
-            {"index": 1, "keep_slot_ids": ["s1-c0"], "fills": [{"slot_id": "s1-c0", "heading": "C"}]}
-        ]}))
+        let missing_heading: TemplatePlan = serde_json::from_value(json!({"slides": [{
+            "index": 0,
+            "keep_slot_ids": ["s0-c0", "s0-c1", "s0-c2"],
+            "fills": [
+                {"slot_id": "s0-c0", "body": "a\nb"},
+                {"slot_id": "s0-c1", "heading": "B", "body": "c"},
+                {"slot_id": "s0-c2", "heading": "C", "body": "d\ne\nf"}
+            ]
+        }]}))
         .unwrap();
-        assert!(validate_template_coverage(&good, &outline).is_ok());
+        assert!(validate_template_coverage(&missing_heading, &outline).is_err());
     }
 
     #[test]
